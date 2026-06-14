@@ -1,6 +1,6 @@
 # DevOps Engineer — Take-Home Exercise
 
-**Time budget:** ~1-2 hours. We respect your time — please don't exceed this. We're far
+**Time budget:** ~1-2 hours. We respect your time — you don't need to exceed this. We're far
 more interested in your *judgment and trade-off thinking* than in polish or completeness. Using AI tools is completely acceptable but it is expected that anything you submit is reviewed and endorsed by you and that you can discuss any aspect of it during the interview.
 
 **Format:** A short design document **plus one small working artifact** (your choice — see
