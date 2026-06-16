@@ -175,17 +175,23 @@ jobs:
             fi
           done
 
-      - name: Rails health probe against idle DB
-        env:
-          DATABASE_URL: ${{ steps.db-url.outputs.url }}
+      - name: Schema integrity check
         run: |
-          # Run a lightweight Rails boot check against the idle DB.
-          # If the app can connect and load the schema, we're good to promote.
-          az containerapp job start \
-            --name           "$MIGRATION_JOB_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --env-vars       "DATABASE_URL=$DATABASE_URL" \
-            -- bundle exec rails runner "puts 'health-ok'; ActiveRecord::Base.connection.execute('SELECT 1')"
+          DB_URL="${{ steps.db-url.outputs.url }}"
+
+          # Confirm Rails schema_migrations table is present and non-empty —
+          # a truncated or incomplete migration would leave it missing or empty.
+          MIGRATIONS=$(psql "$DB_URL" -t -c \
+            "SELECT COUNT(*) FROM schema_migrations;")
+          echo "schema_migrations rows: $MIGRATIONS"
+          if [ "$MIGRATIONS" -lt 1 ]; then
+            echo "::error::schema_migrations is empty — migration did not complete. Aborting promotion."
+            exit 1
+          fi
+
+          # Verify the DB is accepting connections and the search path resolves.
+          psql "$DB_URL" -c "SELECT current_database(), now();"
+          echo "Schema integrity check passed."
 
   # ─────────────────────────────────────────────
   # 4. Promote: swap DATABASE_URL in Key Vault
