@@ -73,7 +73,7 @@ resource "azurerm_redis_cache" "main" {
   family   = "C"
   capacity = 2
 
-  enable_non_ssl_port           = false
+  non_ssl_port_enabled          = false
   minimum_tls_version           = "1.2"
   public_network_access_enabled = false
 

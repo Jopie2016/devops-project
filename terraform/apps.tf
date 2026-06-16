@@ -34,17 +34,20 @@ resource "azurerm_container_app_environment" "main" {
 locals {
   # Shared environment variables injected into all three workloads.
   common_env = [
-    { name = "RAILS_ENV",        value = "production" },
-    { name = "OV_DB_HOST",       value = var.legacy_db_host },
-    { name = "OV_DB_PORT",       value = "1433" },
-    { name = "OV_DB_NAME",       value = var.legacy_db_name },
-    { name = "OV_DB_USERNAME",   value = var.legacy_db_username },
+    { name = "RAILS_ENV", value = "production" },
+    { name = "OV_DB_HOST", value = var.legacy_db_host },
+    { name = "OV_DB_PORT", value = "1433" },
+    { name = "OV_DB_NAME", value = var.legacy_db_name },
+    { name = "OV_DB_USERNAME", value = var.legacy_db_username },
   ]
+  # ACA secret names must be lowercase alphanumeric/'-'. We map each Key Vault
+  # secret to a lowercase ACA secret name, then expose it to the app under its
+  # real (upper-case) env-var name via secret_name.
   common_secrets = [
-    { name = "DATABASE_URL",     key_vault_secret_id = azurerm_key_vault_secret.database_url.id },
-    { name = "REDIS_URL",        key_vault_secret_id = azurerm_key_vault_secret.redis_url.id },
-    { name = "OV_DB_PASSWORD",   key_vault_secret_id = azurerm_key_vault_secret.legacy_db_password.id },
-    { name = "RAILS_MASTER_KEY", key_vault_secret_id = azurerm_key_vault_secret.rails_master_key.id },
+    { env = "DATABASE_URL", secret = "database-url", kv = azurerm_key_vault_secret.database_url.id },
+    { env = "REDIS_URL", secret = "redis-url", kv = azurerm_key_vault_secret.redis_url.id },
+    { env = "OV_DB_PASSWORD", secret = "ov-db-password", kv = azurerm_key_vault_secret.legacy_db_password.id },
+    { env = "RAILS_MASTER_KEY", secret = "rails-master-key", kv = azurerm_key_vault_secret.rails_master_key.id },
   ]
 }
 
@@ -65,10 +68,20 @@ resource "azurerm_container_app" "web" {
     identity = azurerm_user_assigned_identity.aca.id
   }
 
+  # Pull each secret from Key Vault using the app's managed identity.
+  dynamic "secret" {
+    for_each = local.common_secrets
+    content {
+      name                = secret.value.secret
+      key_vault_secret_id = secret.value.kv
+      identity            = azurerm_user_assigned_identity.aca.id
+    }
+  }
+
   ingress {
     external_enabled = true
     target_port      = 3000
-    transport        = "http"   # ACA upgrades WS connections automatically
+    transport        = "http" # ACA upgrades WS connections automatically
 
     traffic_weight {
       latest_revision = true
@@ -81,15 +94,27 @@ resource "azurerm_container_app" "web" {
     max_replicas = 6
 
     container {
-      name   = "web"
-      image  = var.app_image
-      cpu    = 1.0
-      memory = "2Gi"
+      name    = "web"
+      image   = var.app_image
+      cpu     = 1.0
+      memory  = "2Gi"
       command = ["bundle", "exec", "puma", "-C", "config/puma.rb"]
 
       dynamic "env" {
         for_each = local.common_env
-        content { name = env.value.name; value = env.value.value }
+        content {
+          name  = env.value.name
+          value = env.value.value
+        }
+      }
+
+      # Secret-backed env vars (DATABASE_URL, REDIS_URL, etc.).
+      dynamic "env" {
+        for_each = local.common_secrets
+        content {
+          name        = env.value.env
+          secret_name = env.value.secret
+        }
       }
     }
 
@@ -117,6 +142,15 @@ resource "azurerm_container_app" "worker" {
     identity = azurerm_user_assigned_identity.aca.id
   }
 
+  dynamic "secret" {
+    for_each = local.common_secrets
+    content {
+      name                = secret.value.secret
+      key_vault_secret_id = secret.value.kv
+      identity            = azurerm_user_assigned_identity.aca.id
+    }
+  }
+
   template {
     min_replicas = 1
     max_replicas = 4
@@ -130,7 +164,18 @@ resource "azurerm_container_app" "worker" {
 
       dynamic "env" {
         for_each = local.common_env
-        content { name = env.value.name; value = env.value.value }
+        content {
+          name  = env.value.name
+          value = env.value.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = local.common_secrets
+        content {
+          name        = env.value.env
+          secret_name = env.value.secret
+        }
       }
     }
 
@@ -158,6 +203,13 @@ resource "azurerm_container_app_job" "migration" {
   replica_timeout_in_seconds = 50400 # 14 hours — covers worst-case audit-log run
   replica_retry_limit        = 0     # pipeline handles retries explicitly
 
+  # Triggered on demand by the nightly GitHub Actions workflow
+  # (az containerapp job start), not on an ACA-internal schedule.
+  manual_trigger_config {
+    parallelism              = 1 # one run at a time — enforces the nightly lock
+    replica_completion_count = 1
+  }
+
   identity {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.aca.id]
@@ -166,6 +218,15 @@ resource "azurerm_container_app_job" "migration" {
   registry {
     server   = azurerm_container_registry.main.login_server
     identity = azurerm_user_assigned_identity.aca.id
+  }
+
+  dynamic "secret" {
+    for_each = local.common_secrets
+    content {
+      name                = secret.value.secret
+      key_vault_secret_id = secret.value.kv
+      identity            = azurerm_user_assigned_identity.aca.id
+    }
   }
 
   template {
@@ -178,7 +239,18 @@ resource "azurerm_container_app_job" "migration" {
 
       dynamic "env" {
         for_each = local.common_env
-        content { name = env.value.name; value = env.value.value }
+        content {
+          name  = env.value.name
+          value = env.value.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = local.common_secrets
+        content {
+          name        = env.value.env
+          secret_name = env.value.secret
+        }
       }
     }
   }

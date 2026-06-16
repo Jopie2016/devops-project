@@ -36,19 +36,21 @@ resource "azurerm_monitor_scheduled_query_rules_alert_v2" "migration_overrun" {
   name                = "migration-job-overrun"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
-  description         = "Migration job still running after 12 hours — may miss the morning window."
+  description         = "Migration still emitting logs 6h in — early warning it may miss the ~8h window."
   severity            = 2 # Warning
   enabled             = true
 
-  scopes                  = [azurerm_log_analytics_workspace.main.id]
-  evaluation_frequency    = "PT1H"
-  window_duration         = "PT12H"
+  # Fires while there's still time to act inside the overnight window, rather
+  # than after it has already been missed. Valid window values cap below 24h.
+  scopes               = [azurerm_log_analytics_workspace.main.id]
+  evaluation_frequency = "PT1H"
+  window_duration      = "PT6H"
 
   criteria {
     query = <<-QUERY
       ContainerAppConsoleLogs_CL
       | where ContainerName_s == "migration"
-      | where TimeGenerated > ago(12h)
+      | where TimeGenerated > ago(6h)
       | summarize count()
       | where count_ > 0
     QUERY

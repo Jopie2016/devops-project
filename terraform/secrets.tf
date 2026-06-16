@@ -39,7 +39,7 @@ resource "azurerm_user_assigned_identity" "aca" {
 resource "azurerm_key_vault_secret" "database_url" {
   name         = "DATABASE-URL"
   key_vault_id = azurerm_key_vault.main.id
-  value = "postgresql://ovadmin:${random_password.postgres_admin.result}@${azurerm_postgresql_flexible_server.main.fqdn}:5432/app_${var.active_db}?sslmode=require"
+  value        = "postgresql://ovadmin:${random_password.postgres_admin.result}@${azurerm_postgresql_flexible_server.main.fqdn}:5432/app_${var.active_db}?sslmode=require"
 }
 
 resource "azurerm_key_vault_secret" "redis_url" {

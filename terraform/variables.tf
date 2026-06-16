@@ -28,10 +28,25 @@ variable "active_db" {
 
 # Legacy SQL Server credentials — injected at plan time from CI secrets,
 # never stored in source control.
-variable "legacy_db_host"     { type = string; sensitive = true }
-variable "legacy_db_name"     { type = string; sensitive = true }
-variable "legacy_db_username" { type = string; sensitive = true }
-variable "legacy_db_password" { type = string; sensitive = true }
+variable "legacy_db_host" {
+  type      = string
+  sensitive = true
+}
+
+variable "legacy_db_name" {
+  type      = string
+  sensitive = true
+}
+
+variable "legacy_db_username" {
+  type      = string
+  sensitive = true
+}
+
+variable "legacy_db_password" {
+  type      = string
+  sensitive = true
+}
 
 variable "alert_email" {
   description = "Email address for Azure Monitor job-failure and overrun alerts."

@@ -76,7 +76,13 @@ jobs:
   run-migration:
     name: Run migration job (ACA)
     needs: restore-legacy-backup
-    runs-on: ubuntu-latest
+    # IMPORTANT: the migration runs 4–8+ hours, longer than a GitHub-hosted
+    # runner's 6-hour job limit. The *execution* lives in the ACA Job, but the
+    # poll loop below also needs to outlast 6h, so it runs on a self-hosted
+    # runner (no time limit). Alternative without self-hosted infra: make this
+    # job fire-and-forget and let a separate, schedule-triggered workflow detect
+    # completion and run validate+promote. Self-hosted keeps the flow linear.
+    runs-on: [self-hosted, linux]
     env:
       IDLE_DB: ${{ needs.restore-legacy-backup.outputs.idle_db }}
     steps:
