@@ -1,0 +1,265 @@
+name: Nightly Legacy Sync
+
+# Runs at 22:00 UTC — targets completion well inside the ~8h overnight window.
+# Can also be triggered manually (e.g. to re-run a failed night or to test).
+on:
+  schedule:
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+    inputs:
+      skip_audit_logs:
+        description: "Skip the ~335M-row audit-log phase (faster run, use during parallel-run period)"
+        type: boolean
+        default: true
+
+env:
+  AZURE_RESOURCE_GROUP: ov-production-rg
+  ACA_ENVIRONMENT:      ov-production-env
+  MIGRATION_JOB_NAME:   ov-migration-job
+  WEB_APP_NAME:         ov-web
+  WORKER_APP_NAME:      ov-worker
+  KEY_VAULT_NAME:       ov-production-kv
+  POSTGRES_SERVER:      ov-production-pg
+
+# Only one nightly run at a time. If a previous run is still going, cancel it
+# and let the current one start fresh (the migration engine is idempotent).
+concurrency:
+  group: nightly-sync
+  cancel-in-progress: false  # don't cancel a running migration mid-flight
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. Restore legacy SQL Server backup to an
+  #    ephemeral copy (never reads live prod).
+  # ─────────────────────────────────────────────
+  restore-legacy-backup:
+    name: Restore legacy SQL backup
+    runs-on: ubuntu-latest
+    outputs:
+      idle_db: ${{ steps.determine-slot.outputs.idle_db }}
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Determine idle blue/green slot
+        id: determine-slot
+        run: |
+          ACTIVE=$(az keyvault secret show \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name "ACTIVE-DB-SLOT" \
+            --query value -o tsv)
+          IDLE=$( [ "$ACTIVE" = "blue" ] && echo "green" || echo "blue" )
+          echo "idle_db=$IDLE" >> "$GITHUB_OUTPUT"
+          echo "Active: $ACTIVE  →  Migrating into: $IDLE"
+
+      # The legacy team drops a nightly .bak to Blob Storage.
+      # We restore it to an ephemeral Azure SQL MI so the migration
+      # engine never touches the live production SQL Server.
+      - name: Restore legacy backup to ephemeral SQL MI
+        run: |
+          az sql mi db restore \
+            --dest-name   legacy-restore \
+            --managed-instance "${{ secrets.LEGACY_SQL_MI_NAME }}" \
+            --resource-group   "$AZURE_RESOURCE_GROUP" \
+            --source-database  "${{ secrets.LEGACY_BACKUP_BLOB_URL }}" \
+            --time             "latest"
+
+  # ─────────────────────────────────────────────
+  # 2. Run bin/migrate all inside the ACA Job.
+  #    GitHub-hosted runners cap at 6h — this job
+  #    runs inside ACA with no timeout, up to 14h.
+  # ─────────────────────────────────────────────
+  run-migration:
+    name: Run migration job (ACA)
+    needs: restore-legacy-backup
+    runs-on: ubuntu-latest
+    env:
+      IDLE_DB: ${{ needs.restore-legacy-backup.outputs.idle_db }}
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Start ACA migration job
+        id: start-job
+        run: |
+          # Pass the idle DB name so the job writes to the correct slot.
+          # DATABASE_URL for the idle slot is constructed by the job itself
+          # using the IDLE_DB_SLOT env var alongside the KV-injected creds.
+          EXECUTION_ID=$(az containerapp job start \
+            --name              "$MIGRATION_JOB_NAME" \
+            --resource-group    "$AZURE_RESOURCE_GROUP" \
+            --env-vars          "IDLE_DB_SLOT=$IDLE_DB" \
+            --query             "id" -o tsv)
+          echo "execution_id=$EXECUTION_ID" >> "$GITHUB_OUTPUT"
+          echo "Started ACA Job execution: $EXECUTION_ID"
+
+      # Poll until the ACA Job finishes. The job itself takes 4–8+ hours;
+      # this step simply waits and exits with the job's exit code.
+      - name: Wait for migration job to complete
+        run: |
+          EXECUTION_ID="${{ steps.start-job.outputs.execution_id }}"
+          echo "Polling ACA Job execution: $EXECUTION_ID"
+
+          while true; do
+            STATUS=$(az containerapp job execution show \
+              --name           "$MIGRATION_JOB_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --job-execution-name "$EXECUTION_ID" \
+              --query          "properties.status" -o tsv)
+
+            echo "$(date -u '+%H:%M:%S UTC')  status=$STATUS"
+
+            case "$STATUS" in
+              Succeeded) echo "Migration succeeded."; exit 0 ;;
+              Failed)    echo "::error::Migration job FAILED."; exit 1 ;;
+              *) sleep 300 ;; # check every 5 minutes
+            esac
+          done
+
+  # ─────────────────────────────────────────────
+  # 3. Smoke-test the idle DB before promoting.
+  #    Failure here leaves the app untouched on
+  #    the last good database.
+  # ─────────────────────────────────────────────
+  validate:
+    name: Validate migrated database
+    needs: [restore-legacy-backup, run-migration]
+    runs-on: ubuntu-latest
+    env:
+      IDLE_DB: ${{ needs.restore-legacy-backup.outputs.idle_db }}
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Fetch idle DB connection string
+        id: db-url
+        run: |
+          PG_PASS=$(az keyvault secret show \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name "POSTGRES-ADMIN-PASSWORD" \
+            --query value -o tsv)
+          PG_HOST=$(az postgres flexible-server show \
+            --name "$POSTGRES_SERVER" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query fullyQualifiedDomainName -o tsv)
+          echo "url=postgresql://ovadmin:${PG_PASS}@${PG_HOST}:5432/app_${IDLE_DB}?sslmode=require" >> "$GITHUB_OUTPUT"
+
+      - name: Row-count sanity checks
+        run: |
+          EXPECTED_MIN=1000   # adjust to realistic lower bound for your data set
+          for table in cases users documents; do
+            COUNT=$(psql "${{ steps.db-url.outputs.url }}" \
+              -t -c "SELECT COUNT(*) FROM $table;")
+            echo "Table $table: $COUNT rows"
+            if [ "$COUNT" -lt "$EXPECTED_MIN" ]; then
+              echo "::error::Table $table has only $COUNT rows — below minimum $EXPECTED_MIN. Aborting promotion."
+              exit 1
+            fi
+          done
+
+      - name: Rails health probe against idle DB
+        env:
+          DATABASE_URL: ${{ steps.db-url.outputs.url }}
+        run: |
+          # Run a lightweight Rails boot check against the idle DB.
+          # If the app can connect and load the schema, we're good to promote.
+          az containerapp job start \
+            --name           "$MIGRATION_JOB_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --env-vars       "DATABASE_URL=$DATABASE_URL" \
+            -- bundle exec rails runner "puts 'health-ok'; ActiveRecord::Base.connection.execute('SELECT 1')"
+
+  # ─────────────────────────────────────────────
+  # 4. Promote: swap DATABASE_URL in Key Vault
+  #    and rolling-restart the app. Rollback is
+  #    re-running this step with the old slot.
+  # ─────────────────────────────────────────────
+  promote:
+    name: Promote idle DB to live
+    needs: [restore-legacy-backup, validate]
+    runs-on: ubuntu-latest
+    env:
+      IDLE_DB: ${{ needs.restore-legacy-backup.outputs.idle_db }}
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update DATABASE_URL in Key Vault to idle (now new live) slot
+        run: |
+          PG_PASS=$(az keyvault secret show \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name "POSTGRES-ADMIN-PASSWORD" \
+            --query value -o tsv)
+          PG_HOST=$(az postgres flexible-server show \
+            --name "$POSTGRES_SERVER" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query fullyQualifiedDomainName -o tsv)
+
+          NEW_URL="postgresql://ovadmin:${PG_PASS}@${PG_HOST}:5432/app_${IDLE_DB}?sslmode=require"
+
+          az keyvault secret set \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name  "DATABASE-URL" \
+            --value "$NEW_URL"
+
+          # Record the newly active slot so tomorrow's run knows the inverse.
+          az keyvault secret set \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name  "ACTIVE-DB-SLOT" \
+            --value "$IDLE_DB"
+
+          echo "Promoted: app_${IDLE_DB} is now live."
+
+      - name: Rolling restart web app (drains WebSocket connections gracefully)
+        run: |
+          az containerapp revision restart \
+            --name           "$WEB_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP"
+
+      - name: Rolling restart worker
+        run: |
+          az containerapp revision restart \
+            --name           "$WORKER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP"
+
+  # ─────────────────────────────────────────────
+  # 5. Teardown: destroy the ephemeral SQL copy.
+  #    Cost is bounded to the migration window.
+  # ─────────────────────────────────────────────
+  teardown:
+    name: Teardown ephemeral SQL restore
+    needs: promote
+    runs-on: ubuntu-latest
+    if: always() # run even if promote failed — don't leave the MI running
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete ephemeral legacy restore database
+        run: |
+          az sql mi db delete \
+            --name             legacy-restore \
+            --managed-instance "${{ secrets.LEGACY_SQL_MI_NAME }}" \
+            --resource-group   "$AZURE_RESOURCE_GROUP" \
+            --yes
+          echo "Ephemeral SQL restore torn down."
