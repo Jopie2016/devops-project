@@ -35,7 +35,7 @@
 
 ## 2. The Nightly Migration Pipeline (centerpiece)
 
-**Orchestrator/executor split — the key decision.** GitHub Actions is the **scheduler and orchestrator brain**; the **ACA Job is the heavy executor**. I do *not* run `bin/migrate all` inside a GitHub-hosted runner because runners cap at 6 hours and the migration runs 4–8 (up to 12+ with audit logs). The runner triggers the job, watches it, and runs the short promote/validate steps; the multi-hour work lives where nothing will kill it.
+**Orchestrator/executor split — the key decision.** GitHub Actions is the **scheduler and orchestrator brain**; the **ACA Job is the heavy executor**. I do *not* run `bin/migrate all` inside a GitHub-hosted runner because runners cap at 6 hours and the migration runs 4–8 (up to 12+ with audit logs). The trigger and the short promote/validate steps use a standard GitHub-hosted runner. The poll-for-completion step — which must outlast 6h — runs on a **self-hosted runner** (no time limit). The multi-hour execution itself lives in the ACA Job where nothing can kill it mid-run.
 
 ### Step 1 — Obtain legacy data safely (no load on prod)
 - **Assumption (stated):** the legacy team takes regular full backups we can access.
@@ -46,12 +46,15 @@
 ### Step 2 — Run the migration where it can't be killed
 - **ACA Job** triggered nightly (~22:00, targeting completion well inside the ~8h window).
 - Runs `bin/migrate all` with `OV_DB_*` pointed at the ephemeral SQL MI and `DATABASE_URL` pointed at the **idle** database (green if the app is serving blue, and vice-versa).
-- **Concurrency lock:** the job acquires a **blob lease** at start — a second night can't overlap a still-running one.
+- **Concurrency lock:** two layers prevent overlapping runs — a GitHub Actions `concurrency` group (only one workflow run active at a time) and `parallelism: 1` on the ACA Job itself (only one execution replica allowed). Together they guarantee a second night can't start while the first is still running.
 - **Long runtime / retries / re-runs:** the engine is idempotent (truncate-and-rewrite) and tracks its own progress, so a failed or half-finished run is simply re-run. The ACA Job has a generous replica timeout that exceeds worst-case runtime, and inherits the engine's own transient-blip retries.
 
 ### Step 3 — Validate before promoting
-- Post-migration **smoke checks** against the idle DB: row counts within expected bounds vs. the previous run, key tables non-empty, and a `rails runner` boot/health probe.
-- **If validation fails → alert and stop.** The app keeps serving last night's good data on the *other* database. Nothing partial is ever exposed.
+- Post-migration **smoke checks** against the idle DB over a direct `psql` connection (no app boot required):
+  - **Row counts** on key tables (`cases`, `users`, `documents`) must exceed a known minimum threshold.
+  - **Schema integrity:** `schema_migrations` must be non-empty — a truncated run leaves it missing or empty.
+  - **Connectivity:** a `SELECT current_database(), now()` confirms the DB is accepting connections.
+- **If any check fails → alert and stop.** The app keeps serving last night's good data on the *other* database. Nothing partial is ever exposed.
 
 ### Step 4 — Promote (cut-in / swap)
 - Update the `DATABASE_URL` secret in **Key Vault** to point at the freshly migrated DB.
@@ -67,7 +70,7 @@
 ### Cross-cutting
 - **Secrets:** Key Vault → ACA secret refs (legacy creds, `DATABASE_URL`, Redis URL, app keys). Never in the image.
 - **Networking:** everything reachable only over the VNet via private endpoints.
-- **Alerting:** Azure Monitor fires on **job failure** *and* on **window overrun** (job still running near the end of the window) so a slow night is caught before it becomes a missed morning.
+- **Alerting:** Azure Monitor fires on **job failure** *and* on **early overrun warning** (migration still emitting logs after 6h — while time remains in the ~8h window to act, page someone, or skip the audit-log phase).
 - **Cost:** ACA scales the serving tier to demand; the migration job and the SQL MI exist only during the window; Postgres is right-sized with HA. No idle large compute.
 
 ---
